@@ -1,0 +1,28 @@
+{
+  "name": "webpage-screenshot-automation",
+  "version": "1.0.0",
+  "description": "웹페이지 스크린샷 자동화 도구",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts"
+  },
+  "keywords": [
+    "puppeteer",
+    "screenshot",
+    "web-scraping"
+  ],
+  "author": "Ryan",
+  "license": "MIT",
+  "dependencies": {
+    "fs-extra": "^11.3.0",
+    "puppeteer": "^24.9.0"
+  },
+  "devDependencies": {
+    "@types/fs-extra": "^11.0.4",
+    "@types/node": "^22.15.24",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.8.3"
+  }
+}
