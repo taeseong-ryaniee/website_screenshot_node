@@ -1,10 +1,9 @@
 import { NextResponse } from 'next/server';
-import puppeteer from 'puppeteer';
+import puppeteer, { Page } from 'puppeteer'; // Page 타입을 임포트
 import path from 'path';
 import fs from 'fs-extra';
 import { open } from 'sqlite';
 import sqlite3 from 'sqlite3';
-import { snap } from 'snapdom'; // Snapdom 임포트
 
 // SQLite 데이터베이스 초기화 함수
 async function initializeDatabase() {
@@ -24,7 +23,7 @@ async function initializeDatabase() {
 }
 
 // 스크롤 함수 (AOS 처리)
-async function autoScroll(page: any){
+async function autoScroll(page: Page){
     await page.evaluate(async () => {
         await new Promise<void>((resolve) => {
             let totalHeight = 0;
@@ -54,9 +53,9 @@ const isValidUrl = (url: string, baseUrl: string): boolean => {
     }
 };
 
-// Snapdom을 사용한 크롤러 함수
-async function crawlLinksWithSnapdom(startUrl: string): Promise<string[]> {
-    console.log('[Snapdom] 링크 수집을 시작합니다...');
+// Puppeteer를 사용한 크롤러 함수
+async function crawlLinksWithPuppeteer(page: Page, startUrl: string): Promise<string[]> {
+    console.log('[Puppeteer] 링크 수집을 시작합니다...');
     const visited = new Set<string>();
     const queue: string[] = [startUrl];
     visited.add(startUrl);
@@ -64,74 +63,83 @@ async function crawlLinksWithSnapdom(startUrl: string): Promise<string[]> {
     let i = 0;
     while (i < queue.length) {
         const currentUrl = queue[i++];
-        console.log(`[Snapdom] 수집 중: ${currentUrl}`);
+        console.log(`[Puppeteer] 수집 중: ${currentUrl}`);
 
         try {
-            const { window } = await snap(currentUrl);
-            const links = Array.from(window.document.querySelectorAll('a[href]'))
-                .map(a => (a as HTMLAnchorElement).href)
-                .map(href => new URL(href, currentUrl).href) // 상대 경로를 절대 경로로 변환
-                .filter(href => href && href.startsWith('http'));
+            if (page.url() !== currentUrl) {
+                await page.goto(currentUrl, { waitUntil: 'networkidle2' });
+            }
+            const links = await page.evaluate(() =>
+                Array.from(document.querySelectorAll('a[href]'))
+                    .map(a => (a as HTMLAnchorElement).href)
+            );
 
             for (const link of links) {
-                if (isValidUrl(link, startUrl) && !visited.has(link)) {
-                    visited.add(link);
-                    queue.push(link);
+                const absoluteLink = new URL(link, currentUrl).href;
+                if (isValidUrl(absoluteLink, startUrl) && !visited.has(absoluteLink)) {
+                    visited.add(absoluteLink);
+                    queue.push(absoluteLink);
                 }
             }
         } catch (error) {
-            console.error(`[Snapdom] ${currentUrl} 수집 중 오류:`, error);
+            console.error(`[Puppeteer] ${currentUrl} 수집 중 오류:`, error);
         }
     }
-    console.log(`[Snapdom] 총 ${visited.size}개의 고유한 URL을 수집했습니다.`);
+    console.log(`[Puppeteer] 총 ${visited.size}개의 고유한 URL을 수집했습니다.`);
     return Array.from(visited);
 }
 
 
 export async function POST(request: Request) {
-    const { startUrl, needsLogin, username, password } = await request.json();
+    const { startUrl, needsLogin, username, password, selectors } = await request.json();
 
     if (!startUrl) {
         return NextResponse.json({ message: '시작 URL을 입력해주세요.' }, { status: 400 });
     }
 
+    const db = await initializeDatabase();
+    const browser = await puppeteer.launch({ headless: true });
+    const page = await browser.newPage();
+
+    // 공통 페이지 설정
+    await page.setExtraHTTPHeaders({ 'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7' });
+    await page.emulate({ viewport: { width: 1920, height: 1080 }, locale: 'ko-KR' });
+
     try {
-        // --- 1단계: Snapdom으로 링크 크롤링 ---
-        const urlsToCapture = await crawlLinksWithSnapdom(startUrl);
+        let urlsToCapture: string[] = [];
+
+        // --- 1단계: 로그인 (필요시) ---
+        if (needsLogin && username && password && selectors) {
+            console.log('[Puppeteer] 로그인 페이지로 이동합니다...');
+            const loginPageUrl = selectors.loginUrl || new URL(startUrl).origin;
+            await page.goto(loginPageUrl, { waitUntil: 'networkidle2' });
+            
+            console.log('[Puppeteer] 로그인 정보를 입력합니다...');
+            await page.waitForSelector(selectors.idSelector);
+            await page.type(selectors.idSelector, username);
+            await page.waitForSelector(selectors.pwSelector);
+            await page.type(selectors.pwSelector, password);
+
+            console.log('[Puppeteer] 로그인 버튼을 클릭합니다...');
+            await page.click(selectors.btnSelector);
+
+            await page.waitForNavigation({ waitUntil: 'networkidle2' }).catch(() => console.log('페이지 이동 감지 안됨. 계속 진행.'));
+            console.log('[Puppeteer] 로그인 시도 완료.');
+            
+            // --- 2단계 (A): 로그인 후 Puppeteer로 크롤링 ---
+            urlsToCapture = await crawlLinksWithPuppeteer(page, startUrl);
+
+        } else {
+            // --- 2단계 (B): 로그인 불필요 시 Puppeteer로 크롤링
+            urlsToCapture = await crawlLinksWithPuppeteer(page, startUrl);
+        }
 
         if (!urlsToCapture || urlsToCapture.length === 0) {
             return NextResponse.json({ message: '캡처할 URL을 수집하지 못했습니다.' }, { status: 400 });
         }
-        
-        // --- 2단계: Puppeteer로 스크린샷 캡처 ---
+
+        // --- 3단계: 스크린샷 캡처 ---
         console.log('[Puppeteer] 스크린샷 캡처를 시작합니다...');
-        const db = await initializeDatabase();
-        const browser = await puppeteer.launch({ headless: true });
-        const page = await browser.newPage();
-
-        // 공통 페이지 설정
-        await page.setExtraHTTPHeaders({ 'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7' });
-        await page.emulate({ viewport: { width: 1920, height: 1080 }, locale: 'ko-KR' });
-
-        // 로그인 처리 (필요시)
-        if (needsLogin && username && password) {
-            console.log('[Puppeteer] 로그인 페이지로 이동합니다...');
-            await page.goto("https://lms.cbitlelms.or.kr/", { waitUntil: 'networkidle2' });
-            
-            console.log('[Puppeteer] 로그인 정보를 입력합니다...');
-            await page.waitForSelector('input#id');
-            await page.type('input#id', username);
-            await page.waitForSelector('input#password');
-            await page.type('input#password', password);
-
-            console.log('[Puppeteer] 로그인 버튼을 클릭합니다...');
-            await page.click('button.btn-login');
-
-            await page.waitForNavigation({ waitUntil: 'networkidle2' }).catch(() => console.log('페이지 이동 감지 안됨. 계속 진행.'));
-            console.log('[Puppeteer] 로그인 시도 완료.');
-        }
-
-        // 스크린샷 캡처 로직
         const screenshotsDir = path.join(process.cwd(), 'public', 'screenshots');
         await fs.ensureDir(screenshotsDir);
 
@@ -158,12 +166,13 @@ export async function POST(request: Request) {
             }
         }
         
-        await browser.close();
-        await db.close();
         return NextResponse.json({ message: `총 ${urlsToCapture.length}개의 페이지 캡처를 완료했습니다.`, count: urlsToCapture.length });
 
     } catch (error: any) {
         console.error('API Error:', error);
         return NextResponse.json({ message: '작업 중 오류가 발생했습니다.', error: error.message }, { status: 500 });
+    } finally {
+        await browser.close();
+        await db.close();
     }
 }
